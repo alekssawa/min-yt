@@ -8,73 +8,67 @@ interface Track {
 	duration?: number
 	thumbnail?: string
 	index: number
+	url: string
 }
 
 export default function PlaylistPlayer() {
 	const [url, setUrl] = useState('')
 	const [tracks, setTracks] = useState<Track[]>([])
 	const [currentIndex, setCurrentIndex] = useState(0)
-	const [audioUrl, setAudioUrl] = useState('')
 	const [loading, setLoading] = useState(false)
+
 	const [progress, setProgress] = useState(0)
+	const [buffered, setBuffered] = useState(0) // 🆕 Состояние для буфера
 	const [volume, setVolume] = useState(1)
+
 	const audioRef = useRef<HTMLAudioElement>(null)
 
-	// Получаем список треков
+	// ... (fetchPlaylist оставляем без изменений) ...
 	const fetchPlaylist = async () => {
-		if (!url) return
+		if (!url.trim()) return
 		setLoading(true)
 		try {
-			const res = await fetch('http://localhost:4000/playlist', {
+			const res = await fetch('http://localhost:4000/info', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ url }),
 			})
 			const data = await res.json()
-
-			console.log(data)
 			if (data.tracks && data.tracks.length > 0) {
-				setTracks(
-					data.tracks.map((t: Track, i: number) => ({
+				setTracks(prev => {
+					const startIndex = prev.length
+					const newTracks = data.tracks.map((t: Track, i: number) => ({
 						...t,
-						index: i,
-					})),
-				)
-				setCurrentIndex(0)
-			} else {
-				setTracks([{ title: 'Текущий трек', index: 0 }])
-				setCurrentIndex(0)
+						index: i + startIndex,
+					}))
+					return [...prev, ...newTracks]
+				})
+				if (tracks.length === 0) setCurrentIndex(0)
 			}
 		} catch (err) {
 			console.error(err)
 			alert('Ошибка получения треков')
 		} finally {
+			setUrl('')
 			setLoading(false)
 		}
 	}
 
-	// Скачиваем текущий трек
-	const downloadTrack = async (index: number) => {
-		setLoading(true)
-		try {
-			const res = await fetch('http://localhost:4000/download', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ url, trackIndex: index + 1 }),
-			})
-			if (!res.ok) throw new Error('Download failed')
-			const blob = await res.blob()
-			const objectUrl = URL.createObjectURL(blob)
-			setAudioUrl(objectUrl)
-		} catch (err) {
-			console.error(err)
-			alert('Ошибка скачивания трека')
-		} finally {
-			setLoading(false)
+	const setStreamTrack = (index: number) => {
+		const track = tracks[index]
+		if (!track) return
+
+		// Сбрасываем прогресс и буфер при смене трека
+		setProgress(0)
+		setBuffered(0)
+
+		const streamUrl = `http://localhost:4000/stream?url=${encodeURIComponent(track.url)}`
+		if (audioRef.current) {
+			audioRef.current.src = streamUrl
+			audioRef.current.play()
 		}
 	}
 
-	// Автозапуск следующего трека
 	const handleEnded = () => {
 		if (currentIndex + 1 < tracks.length) {
 			setCurrentIndex(currentIndex + 1)
@@ -83,18 +77,31 @@ export default function PlaylistPlayer() {
 
 	useEffect(() => {
 		if (tracks.length > 0) {
-			downloadTrack(currentIndex)
+			setStreamTrack(currentIndex)
 		}
 	}, [currentIndex, tracks])
 
-	// Прогресс
-	useEffect(() => {
+	// -------------------------
+	// 🆕 Логика прогресса и буферизации
+	// -------------------------
+	const handleTimeUpdate = () => {
 		const audio = audioRef.current
 		if (!audio) return
-		const update = () => setProgress((audio.currentTime / audio.duration) * 100)
-		audio.addEventListener('timeupdate', update)
-		return () => audio.removeEventListener('timeupdate', update)
-	}, [audioUrl])
+
+		// Текущее время воспроизведения
+		if (audio.duration) {
+			setProgress((audio.currentTime / audio.duration) * 100)
+		}
+
+		// Вычисляем буфер
+		if (audio.buffered.length > 0 && audio.duration) {
+			// audio.buffered может содержать несколько отрезков.
+			// Обычно нас интересует тот, который в конце (сколько всего скачано).
+			// Но для точности берем конец последнего буферизированного отрезка.
+			const bufferedEnd = audio.buffered.end(audio.buffered.length - 1)
+			setBuffered((bufferedEnd / audio.duration) * 100)
+		}
+	}
 
 	const handlePrev = () => {
 		if (currentIndex > 0) setCurrentIndex(currentIndex - 1)
@@ -102,6 +109,7 @@ export default function PlaylistPlayer() {
 	const handleNext = () => {
 		if (currentIndex + 1 < tracks.length) setCurrentIndex(currentIndex + 1)
 	}
+
 	const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
 		const audio = audioRef.current
 		if (!audio) return
@@ -109,19 +117,36 @@ export default function PlaylistPlayer() {
 		audio.volume = newVolume
 		setVolume(newVolume)
 	}
+
 	const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
 		const audio = audioRef.current
-		if (!audio) return
+		if (!audio || !audio.duration) return
+
 		const rect = e.currentTarget.getBoundingClientRect()
 		const clickX = e.clientX - rect.left
 		const newTime = (clickX / rect.width) * audio.duration
-		audio.currentTime = newTime
-		setProgress((newTime / audio.duration) * 100)
+
+		// Проверка: разрешаем мотать только туда, где уже скачано (или чуть-чуть вперед)
+		// Если трек уже полностью на сервере - буфер будет 100%, можно мотать везде.
+		// Если качается - можно мотать только внутри серой полоски.
+		if (audio.buffered.length > 0) {
+			const bufferedEnd = audio.buffered.end(audio.buffered.length - 1)
+			if (newTime > bufferedEnd) {
+				// Опционально: можно запретить клик или поставить на самый край буфера
+				audio.currentTime = bufferedEnd - 1 // прыгаем в самый конец загруженного
+			} else {
+				audio.currentTime = newTime
+			}
+		} else {
+			audio.currentTime = newTime
+		}
+
+		setProgress((audio.currentTime / audio.duration) * 100)
 	}
 
 	return (
 		<div className='p-4 max-w-xl mx-auto'>
-			<h1 className='text-2xl font-bold mb-4'>PulseHub Player</h1>
+			<h1 className='text-2xl font-bold mb-4'>Lisync</h1>
 
 			<div className='flex gap-2 mb-4'>
 				<input
@@ -141,49 +166,60 @@ export default function PlaylistPlayer() {
 			</div>
 
 			{/* Плеер */}
-			{audioUrl && (
+			{tracks[currentIndex] && (
 				<div className='bg-gray-900 p-4 rounded-lg shadow-md text-white'>
-					{tracks[currentIndex]?.thumbnail && (
-						<Image
-							src={tracks[currentIndex].thumbnail}
-							alt={tracks[currentIndex].title}
-							width={500}
-							height={300}
-							className='w-full rounded mb-2'
-						/>
-					)}
-					<h2 className='font-bold mb-1'>{tracks[currentIndex]?.title}</h2>
-					{tracks[currentIndex]?.uploader && (
-						<p className='text-sm text-gray-300 mb-1'>
-							Автор: {tracks[currentIndex].uploader}
-						</p>
-					)}
-					{tracks[currentIndex]?.duration && (
-						<p className='text-sm text-gray-300 mb-2'>
-							Длительность: {Math.floor(tracks[currentIndex].duration / 60)}:
-							{(tracks[currentIndex].duration % 60).toString().padStart(2, '0')}
-						</p>
-					)}
-
-					<audio ref={audioRef} src={audioUrl} autoPlay onEnded={handleEnded} />
-
-					<div
-						className='h-2 bg-gray-700 rounded cursor-pointer mb-3'
-						onClick={handleSeek}
-					>
-						<div
-							className='h-2 bg-blue-500 rounded'
-							style={{ width: `${progress}%` }}
-						/>
+					{/* ... (Image и заголовки оставляем как были) ... */}
+					<div className='mb-4'>
+						{tracks[currentIndex]?.thumbnail && (
+							<Image
+								src={tracks[currentIndex].thumbnail}
+								alt={tracks[currentIndex].title}
+								width={500}
+								height={300}
+								className='w-full rounded mb-2'
+							/>
+						)}
+						<h2 className='font-bold'>{tracks[currentIndex]?.title}</h2>
 					</div>
 
+					{/* Добавляем onProgress для обновления буфера чаще */}
+					<audio
+						ref={audioRef}
+						autoPlay
+						onEnded={handleEnded}
+						onTimeUpdate={handleTimeUpdate}
+						onProgress={handleTimeUpdate}
+					/>
+
+					{/* --- ТАЙМЛАЙН --- */}
+					<div
+						className='relative h-2 bg-gray-700 rounded cursor-pointer mb-3 select-none'
+						onClick={handleSeek}
+					>
+						{/* 1. Полоска буферизации (серая, как на YouTube) */}
+						<div
+							className='absolute top-0 left-0 h-full bg-gray-500 rounded transition-all duration-300'
+							style={{ width: `${buffered}%` }}
+						/>
+
+						{/* 2. Полоска прогресса (синяя/красная) */}
+						<div
+							className='absolute top-0 left-0 h-full bg-blue-500 rounded z-10'
+							style={{ width: `${progress}%` }}
+						/>
+
+						{/* 3. Головка воспроизведения (опционально) */}
+						<div
+							className='absolute top-1/2 -mt-1.5 w-3 h-3 bg-white rounded-full shadow z-20 pointer-events-none'
+							style={{ left: `calc(${progress}% - 6px)` }}
+						/>
+					</div>
+					{/* ---------------- */}
+
+					{/* Контролы (оставляем как были) */}
 					<div className='flex items-center justify-center gap-4'>
-						<button
-							onClick={handlePrev}
-							disabled={currentIndex === 0}
-							className='w-10 h-10 p-2 rounded-full bg-gray-800 hover:bg-gray-700 disabled:opacity-50'
-						>
-							◀
+						<button onClick={handlePrev} className='text-2xl'>
+							⏮
 						</button>
 						<button
 							onClick={() =>
@@ -191,35 +227,24 @@ export default function PlaylistPlayer() {
 									? audioRef.current.play()
 									: audioRef.current?.pause()
 							}
-							className='w-10 h-10 p-2 rounded-full bg-gray-800 hover:bg-gray-700'
+							className='w-12 h-12 rounded-full bg-gray-700 flex items-center justify-center text-xl'
 						>
-							{audioRef.current?.paused ? '▶' : '⏸'}
+							⏯
 						</button>
-						<button
-							onClick={handleNext}
-							disabled={currentIndex + 1 === tracks.length}
-							className='w-10 h-10 p-2 rounded-full bg-gray-800 hover:bg-gray-700 disabled:opacity-50'
-						>
-							▶
+						<button onClick={handleNext} className='text-2xl'>
+							⏭
 						</button>
 
-						<div className='flex items-center gap-2'>
-							<span>🔊</span>
-							<input
-								type='range'
-								min={0}
-								max={1}
-								step={0.01}
-								value={volume}
-								onChange={handleVolumeChange}
-								className='w-24'
-							/>
-						</div>
+						<input
+							type='range'
+							min={0}
+							max={1}
+							step={0.01}
+							value={volume}
+							onChange={handleVolumeChange}
+							className='w-20 accent-blue-500'
+						/>
 					</div>
-
-					<p className='text-sm mt-2 text-gray-300'>
-						{currentIndex + 1}/{tracks.length}
-					</p>
 				</div>
 			)}
 
@@ -258,7 +283,7 @@ export default function PlaylistPlayer() {
 										{track.duration && (
 											<span className='text-xs text-gray-300'>
 												{Math.floor(track.duration / 60)}:
-												{(track.duration % 60).toString().padStart(2, '0')}
+												{String(track.duration % 60).padStart(2, '0')}
 											</span>
 										)}
 									</div>

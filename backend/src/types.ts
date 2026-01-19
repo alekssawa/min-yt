@@ -5,3 +5,12 @@ export interface DownloadOptions {
 	quality?: 'best' | 'worst'
 	playlist?: boolean
 }
+
+export interface TrackInfo {
+  title: string
+  uploader?: string
+  duration?: number
+  thumbnail?: string
+  url: string
+  id?: string
+}
